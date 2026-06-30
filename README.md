@@ -76,8 +76,6 @@ else if (slv_reg0[0])       latched_done <= 1'b0;   // clear khi Start đang = 1
 6. Đọc output từ M_AXIS / DMA S2MM
 ```
 
-Bước 5 **không có trong TB hiện tại** (TB chỉ kick 1 lần rồi `$finish`, không bao giờ test multi-run) — nên hành vi re-trigger này **chưa được verify bằng simulation**, chỉ suy ra từ đọc code. Nếu có ai integrate IP để chạy nhiều inference liên tiếp (ví dụ multi-head attention loop), **phải thêm bước 5 vào driver và nên thêm test case multi-kick vào TB trước khi tin tưởng**.
-
 ---
 
 ## 5. Kiến trúc Core (`linear.sv`)
@@ -96,7 +94,6 @@ Bước 5 **không có trong TB hiện tại** (TB chỉ kick 1 lần rồi `$fi
 
 State machine tự phân biệt theo phase: K nhận trong `ST_LOAD_K`, Q nhận trong `ST_COMPUTE`. SW đảm bảo thứ tự gửi đúng. RTL **không** đọc `tdest` của AXI-Stream input — port `i_s_axis_tdata` chỉ có `tdata/tvalid/tlast`, không có `tdest` trong interface của `linear`.
 
-> Lưu ý: TB hiện tại (`tb_ip_axi_linear.sv`) có set `trans.set_dest()` khi gửi K (dest=0) và Q (dest=1) — đây là dùng tiện ích sẵn có của AXI4-Stream VIP để debug/trace transaction trong waveform, **không phải RTL đọc tdest để định tuyến**. Đừng nhầm là DUT có logic tdest.
 
 ### Double ping-pong buffer
 
