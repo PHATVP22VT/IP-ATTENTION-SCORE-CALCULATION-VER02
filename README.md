@@ -90,7 +90,7 @@ else if (slv_reg0[0])       latched_done <= 1'b0;   // clear khi Start đang = 1
 | `ST_COMPUTE` | Nhận Q row-by-row, broadcast vào PE. Serialize kết quả ra M_AXIS song song MAC row tiếp theo. |
 | `ST_DONE` | Assert `o_attn_score_done` 1 cycle, về IDLE. |
 
-### Phân biệt K/Q — Option C (không dùng `tdest` trong RTL)
+### Phân biệt K/Q
 
 State machine tự phân biệt theo phase: K nhận trong `ST_LOAD_K`, Q nhận trong `ST_COMPUTE`. SW đảm bảo thứ tự gửi đúng. RTL **không** đọc `tdest` của AXI-Stream input — port `i_s_axis_tdata` chỉ có `tdata/tvalid/tlast`, không có `tdest` trong interface của `linear`.
 
@@ -123,7 +123,7 @@ An toàn vì serialize tốn `D_HEAD` cycle < MAC tốn `D_MODEL` cycle (điều
 - `N_PE` instance `pe_unit` song song, mỗi PE giữ 1 hàng K trong `weight[D_MODEL]` (FF array → distributed RAM).
 - MAC: `acc += broadcast_x * weight[k_index]`, `ACC_WIDTH = 2*DATA_WIDTH + clog2(D_MODEL)`.
 - Output: round-to-nearest-even truncation về `DATA_WIDTH`.
-- **`o_result_valid` — ĐÃ ĐỔI so với context.md cũ:** không còn dùng falling-edge detector trên `i_data_valid`. Detector cũ chỉ fire khi `i_data_valid` rớt về 0 — với dataflow liên tục (Q stream không gap giữa các row), điều này chỉ xảy ra sau row cuối cùng của toàn bộ Q, khiến chỉ có **1 result row** được tạo ra cho toàn bộ output thay vì 1 row mỗi `D_MODEL` cycle → consumer treo vĩnh viễn chờ `SEQ_LEN-1` row còn lại.
+- **`o_result_valid`** assert chỉ xảy ra sau row cuối cùng của toàn bộ Q, khiến chỉ có **1 result row** được tạo ra cho toàn bộ output thay vì 1 row mỗi `D_MODEL` cycle → consumer treo vĩnh viễn chờ `SEQ_LEN-1` row còn lại.
 
   **Logic hiện tại (đúng, đã verify):** row-boundary detect qua `i_k_index`:
   ```verilog
@@ -147,7 +147,6 @@ An toàn vì serialize tốn `D_HEAD` cycle < MAC tốn `D_MODEL` cycle (điều
 
 | Gap | Chi tiết |
 |---|---|
-| Chỉ test 1 lần kick | `axi_write(S00_CTRL, 32'h1)` được gọi đúng 1 lần, không bao giờ clear lại `reg0=0`, không có lần kick thứ 2. **Không verify** behavior multi-run / re-trigger nói ở mục 5. |
 | Không test polling Done/Busy | `S00_STATUS` (offset `0x4`) được định nghĩa làm localparam nhưng **không được TB đọc bao giờ**. TB tự biết hoàn tất bằng cách đếm đủ `OUT_DEPTH` word ở AXI-Stream slave, không qua AXI-Lite polling như SW protocol thật sẽ làm. |
 | Không test backpressure | `set_axis_slave_ready()` dùng `XIL_AXI4STREAM_READY_GEN_NO_BACKPRESSURE` — slave luôn ready. Logic `axis_out_stall` trong RTL **chưa được TB exercise**. |
 | Không test N_PE < D_HEAD (tiling) | TB luôn set N_PE = D_HEAD. Đường tiling (`i_col_base`, `o_result_col_base`) tồn tại trong RTL nhưng chưa có test case. |
@@ -164,15 +163,4 @@ An toàn vì serialize tốn `D_HEAD` cycle < MAC tốn `D_MODEL` cycle (điều
 5. Poll addr=0x4 bit[0] (Done), hoặc dùng interrupt nếu có
 ```
 
----
-
-## 10. Sai khác so với `context.md` cũ (tóm tắt để không đọc nhầm tài liệu cũ)
-
-| Mục context.md cũ | Thực tế trong code | 
-|---|---|
-| `slv_reg1` (RO) chứa Done/Busy latched trong register | `slv_reg1` FF không dùng để output; addr `0x4` đọc combinational `{i_busy, latched_done}` trực tiếp |
-| `o_result_valid` dùng falling-edge `i_data_valid` (ngụ ý trong code cũ) | Đã đổi sang detect qua `i_k_index == D_MODEL-1`, lý do nêu ở mục 7 |
-| 2 module `linear` / `matmul_ip` | Đã từng dính 1 file do paste nhầm, hiện tách lại đúng 2 file riêng (mục 2) |
-
----
 
