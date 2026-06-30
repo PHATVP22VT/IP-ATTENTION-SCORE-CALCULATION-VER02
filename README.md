@@ -1,8 +1,5 @@
 # HANDOFF.md — Attention Score IP (Q × Kᵀ)
 
-**Status: DONE — verified, all outputs match golden model.**
-Cập nhật lần cuối: 2026-06-30
-Nguồn sự thật: 5 file RTL/TB trong repo (liệt kê bên dưới). File `context.md` cũ **đã lỗi thời** — xem mục 7 để biết chỗ sai lệch.
 
 ---
 
