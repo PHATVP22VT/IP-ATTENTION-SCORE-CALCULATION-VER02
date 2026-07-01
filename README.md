@@ -1,4 +1,4 @@
-# HANDOFF.md — Attention Score IP (Q × Kᵀ)
+# Attention Score IP (Q × Kᵀ)
 
 
 ---
@@ -41,8 +41,17 @@ Hardware accelerator tính **S = Q × Kᵀ** (Scaled Dot-Product Attention Score
 | `D_MODEL` | 64 | 64 | Số chiều embedding — số cycle MAC mỗi row |
 | `SEQ_LEN` | 64 | 16 | Số hàng Q — số hàng output S |
 | `D_HEAD` | 64 | 16 | Số hàng K — số cột output S |
-| `N_PE` | 64 | 16 | Số PE song song. Luôn = `D_HEAD` (1 tile, không tiling) |
+| `N_PE` | 64 | 16 (test tiling: 9) | Số PE song song. Có thể `N_PE ≤ D_HEAD` — hỗ trợ tiling khi `N_PE < D_HEAD` |
 | `DATA_WIDTH` | 16 | 16 | Bit width signed fixed-point |
+
+`N_TILES = ceil(D_HEAD / N_PE)` — hằng số tính tại elaboration-time (`localparam`, integer division). Khi `N_PE == D_HEAD` thì `N_TILES = 1` (không tiling, tương đương thiết kế 1-tile trước đây). Khi `N_PE < D_HEAD` thì `N_TILES > 1`, mỗi PE giữ `N_TILES` bank weight (multi-bank weight cache), K được preload 1 lần duy nhất, và mỗi row Q chạy nội bộ qua `N_TILES` vòng MAC trước khi serialize kết quả ra.
+
+Điều kiện hợp lệ (synthesis-time assertion trong `linear.sv`):
+```systemverilog
+assert (N_PE <= D_HEAD);
+assert (D_MODEL >= D_HEAD);       // bắt buộc cho an toàn ping-pong buffer
+assert (N_PE * N_TILES >= D_HEAD);
+```
 
 Ma trận (TB config): Q `[16×64]`, K `[16×64]`, S = Q×Kᵀ `[16×16]`.
 
@@ -69,11 +78,10 @@ else if (slv_reg0[0])       latched_done <= 1'b0;   // clear khi Start đang = 1
 
 ```
 1. Stream K → S_AXIS
-2. AXI-Lite write addr=0x0, data=0x1   (Start = 1, kick)
+2. AXI-Lite write addr=0x0, data=0x1   (Start = 1, kick, sau 1 cycle sẽ tự động deassert do slv0[0]<= trong S00)
 3. Stream Q → S_AXIS
 4. Poll addr=0x4 cho tới khi bit[0] (Done) = 1
-5. AXI-Lite write addr=0x0, data=0x0   (Start = 0 — BẮT BUỘC, nếu quên IP sẽ tự re-kick ở lần chạy sau)
-6. Đọc output từ M_AXIS / DMA S2MM
+5. Đọc output từ M_AXIS / DMA S2MM
 ```
 
 ---
@@ -86,8 +94,8 @@ else if (slv_reg0[0])       latched_done <= 1'b0;   // clear khi Start đang = 1
 |---|---|
 | `ST_IDLE` | Chờ `i_start_attn_score`. |
 | `ST_LOAD_K` | `tready=1` không điều kiện, ghi tuần tự vào BRAM Port A, kết thúc khi `tlast`. |
-| `ST_PRELOAD_MAC` | Quét BRAM Port B: j=0..D_HEAD-1, k=0..D_MODEL-1. Pipeline 2-stage delay chain bù latency BRAM (2 cycle). Feed vào `matmul_ip` preload interface. |
-| `ST_COMPUTE` | Nhận Q row-by-row, broadcast vào PE. Serialize kết quả ra M_AXIS song song MAC row tiếp theo. |
+| `ST_PRELOAD_MAC` | Quét BRAM Port B theo 3 chiều: `tile_idx=0..N_TILES-1`, `j=0..N_PE-1` (index PE cục bộ trong tile), `k=0..D_MODEL-1`. Địa chỉ flat = `(tile_idx*N_PE + j)*D_MODEL + k`. Pipeline 2-stage delay chain bù latency BRAM (2 cycle), mang theo `tile_sel` trong delay chain. Ghi vào bank tương ứng `weight[tile_idx][k]` của từng PE. Chạy 1 lần duy nhất cho toàn bộ `N_TILES × N_PE × D_MODEL` địa chỉ (nếu tile cuối partial, các PE dư đọc địa chỉ ngoài `D_HEAD*D_MODEL-1`, dữ liệu này không ảnh hưởng vì bị mask ở bước ghi `result_buffer`, không phải ở bước preload). |
+| `ST_COMPUTE` | Row-outer, tile-inner. Mỗi row Q gồm 2 bước nội bộ:<br>**2a — Nạp Q row**: `tready=1`, nhận `D_MODEL` beat từ AXI-Stream, ghi vào `q_row_buf[D_MODEL]` (register, không BRAM).<br>**2b — Tile loop**: `tready=0` xuyên suốt. Với mỗi `tile_idx=0..N_TILES-1`, broadcast lại `q_row_buf[]` (không cần AXI-Stream), MAC dùng bank weight `tile_idx`. Zero-gap giữa các tile — tile kế tiếp bắt đầu ngay cycle sau khi tile trước hoàn tất, không cần bubble cycle (do accumulator trong `pe_unit` chốt giá trị 1 cycle trước khi `o_result_valid` pulse, cùng cơ chế vốn đã đúng cho biên row-to-row).<br>Serialize ra M_AXIS chỉ trigger sau khi đủ `N_TILES` lần `matmul_result_valid` của row đó (tile cuối xong), chạy song song với bước 2a của row kế tiếp (ping-pong `write_sel`/`read_sel`). |
 | `ST_DONE` | Assert `o_attn_score_done` 1 cycle, về IDLE. |
 
 ### Phân biệt K/Q
@@ -97,12 +105,11 @@ State machine tự phân biệt theo phase: K nhận trong `ST_LOAD_K`, Q nhận
 
 ### Double ping-pong buffer
 
-`result_buffer[0:1][0:N_PE-1]`. Khi `matmul_result_valid`:
-1. Ghi N_PE kết quả vào `buffer[buf_write_sel]`.
-2. `buf_read_sel <= buf_write_sel` (cùng cycle, trước flip).
-3. `buf_write_sel` flip cho row tiếp theo.
+`result_buffer[0:1][0:D_HEAD-1]` (kích thước theo `D_HEAD`, không phải `N_PE`, để chứa đủ 1 row đã ghép từ tất cả các tile). Mỗi `matmul_result_valid` (1 pulse/tile):
+1. Ghi tối đa N_PE kết quả vào `buffer[buf_write_sel]`, offset `tile_idx * N_PE` (lấy từ `matmul_result_col_base`, delay-align với `matmul_result_valid`). Nếu tile cuối partial (`D_HEAD % N_PE != 0`), các PE có `col_base + p >= D_HEAD` bị mask (không ghi).
+2. Chỉ ở pulse cuối cùng của row (khi đã nhận đủ `N_TILES` pulse — `tile_result_cnt` đếm số pulse trong row): `buf_read_sel <= buf_write_sel` và flip `buf_write_sel` cho row tiếp theo. Serializer chỉ bắt đầu chạy tại thời điểm này (không chạy sau mỗi tile).
 
-An toàn vì serialize tốn `D_HEAD` cycle < MAC tốn `D_MODEL` cycle (điều kiện `D_MODEL ≥ D_HEAD` luôn đúng trong mọi config hợp lệ).
+An toàn vì serialize tốn `D_HEAD` cycle < tile loop mỗi row tốn `N_TILES × D_MODEL` cycle (đảm bảo bởi `D_MODEL ≥ D_HEAD` và `N_TILES ≥ 1`).
 
 ### Backpressure
 
@@ -120,36 +127,46 @@ An toàn vì serialize tốn `D_HEAD` cycle < MAC tốn `D_MODEL` cycle (điều
 
 ## 6. `matmul_ip.sv` — Compute Engine
 
-- `N_PE` instance `pe_unit` song song, mỗi PE giữ 1 hàng K trong `weight[D_MODEL]` (FF array → distributed RAM).
-- MAC: `acc += broadcast_x * weight[k_index]`, `ACC_WIDTH = 2*DATA_WIDTH + clog2(D_MODEL)`.
+- `N_PE` instance `pe_unit` song song. Mỗi PE giữ `N_TILES` bank weight: `weight[0:N_TILES-1][0:D_MODEL-1]` (FF array → distributed RAM). Bank được chọn bởi `i_tile_sel` (compute) / `i_preload_tile_sel` (preload), mux 1 tầng combinational (`weight_mux`) trước input MAC.
+- MAC: `acc += broadcast_x * weight_mux`, `ACC_WIDTH = 2*DATA_WIDTH + clog2(D_MODEL)`.
 - Output: round-to-nearest-even truncation về `DATA_WIDTH`.
-- **`o_result_valid`** assert chỉ xảy ra sau row cuối cùng của toàn bộ Q, khiến chỉ có **1 result row** được tạo ra cho toàn bộ output thay vì 1 row mỗi `D_MODEL` cycle → consumer treo vĩnh viễn chờ `SEQ_LEN-1` row còn lại.
-
-  **Logic hiện tại (đúng, đã verify):** row-boundary detect qua `i_k_index`:
+- **`o_result_valid`**: row-boundary detect qua `i_k_index`:
   ```verilog
   assign row_last_beat = i_data_valid & (i_k_index == K_W'(D_MODEL - 1));
   // registered 1 cycle -> o_result_valid
   ```
-  Đúng cho cả continuous lẫn gapped streaming, khớp timing accumulate trong `pe_unit`, không cần giả định "có gap giữa các row".
-
-- `i_col_base` / `o_result_col_base`: dành cho tiling (N_PE < N_COLS), hiện set 0 vì N_PE = D_HEAD = N_COLS (1 tile).
+  Pulse 1 lần mỗi tile (mỗi `D_MODEL` cycle broadcast), đúng cho cả continuous lẫn gapped streaming, khớp timing accumulate trong `pe_unit`. Khi `N_TILES > 1`, pulse này lặp lại `N_TILES` lần mỗi row — caller (`linear.sv`) đếm đủ `N_TILES` pulse mới trigger serialize, không phải sau pulse đầu tiên.
+- Zero-gap giữa các tile an toàn: `acc` trong `pe_unit` chốt giá trị tại cycle `i_k_index == D_MODEL-1` (registered, dùng `weight_mux`/`i_tile_sel` của tile vừa xong), trong khi `i_tile_sel`/`i_acc_clear` cho tile kế tiếp chỉ có hiệu lực ở cạnh clock sau đó — không xung đột, không cần bubble cycle.
+- `i_col_base` / `o_result_col_base`: dùng thực sự cho tiling, `i_col_base = tile_idx * N_PE` truyền từ `linear.sv`. `o_result_col_base` delay 1 cycle để align với `o_result_valid`, dùng làm offset ghi vào `result_buffer`. Khi `N_PE == D_HEAD` (`N_TILES=1`), `i_col_base = 0` cố định — tương đương hành vi cũ.
 
 ---
 
 ## 7. Testbench (`tb_ip_axi_linear.sv`)
 
 - VIP: 1× AXI4-Lite Master VIP, 1× AXI4-Stream Master VIP, 1× AXI4-Stream Slave VIP.
-- TB config: `SEQ_LEN=16, D_HEAD=16, N_PE=16, D_MODEL=64`.
+- TB config: `SEQ_LEN=16, D_HEAD=16, D_MODEL=64`, `N_PE` sửa trực tiếp trong `localparam` (dòng có comment `>>> SỬA SỐ NÀY <<<`) — `N_TILES` tự tính `ceil(D_HEAD/N_PE)`. **Lưu ý:** đổi `N_PE` trong TB chỉ ảnh hưởng cách TB tính `K_DEPTH/Q_DEPTH` và log; DUT (`ip_axi_linear_0`, packaged IP) phải được re-customize cùng giá trị `N_PE` trong Vivado thì mới thực sự đổi hành vi.
 - So sánh `captured_out[]` vs `golden_out[]` đọc từ file `.mem` (golden model ngoài, đường dẫn hardcode local máy — **cần đổi path khi chạy trên máy khác**, xem `MEM_Q/MEM_K/MEM_GOLDEN/RTL_OUT_DIR` ở đầu file).
-- Kết quả PASS: tất cả `OUT_DEPTH = SEQ_LEN×D_HEAD = 256` words khớp golden.
+- Kết quả PASS: tất cả `OUT_DEPTH = SEQ_LEN×D_HEAD = 256` words khớp golden, không có `AXI4STREAM_ERRM_TDATA_X` trên M_AXIS (TB có thêm monitor `$isunknown()` độc lập để ra verdict PASS/FAIL bằng code). Có watchdog timeout (`TIMEOUT_CYCLES`) chặn sim treo vô hạn nếu có deadlock handshake.
 
-### Giới hạn coverage của TB (cần biết trước khi tái sử dụng IP)
+### Test case tiling đã pass
+
+| # | Config (`D_HEAD / N_PE / N_TILES`) | Ghi chú | Kết quả |
+|---|---|---|---|
+| 1 | 16 / 16 / 1 | Regression config gốc, không tiling | PASS |
+| 2 | 16 / 9 / 2 | Case trigger bug ban đầu, tile cuối partial (7/9 PE) | PASS |
+| 3 | 16 / 5 / 4 | Partial tile cực trị (tile cuối chỉ 1/5 PE) | PASS |
+| 4 | 16 / 8 / 2 | Tiling nhưng không có partial tile (chia hết) | PASS |
+| 5 | 16 / 3 / 6 | N_TILES > 2 | PASS |
+| 6 | 16 / 1 / 16 | Cực trị N_PE=1, mỗi tile 1 PE | PASS |
+| 7 | 13 / 4 hoặc 8 / — | D_HEAD lẻ, không chia hết N_PE | PASS |
+
+### Giới hạn coverage còn lại của TB
 
 | Gap | Chi tiết |
 |---|---|
 | Không test polling Done/Busy | `S00_STATUS` (offset `0x4`) được định nghĩa làm localparam nhưng **không được TB đọc bao giờ**. TB tự biết hoàn tất bằng cách đếm đủ `OUT_DEPTH` word ở AXI-Stream slave, không qua AXI-Lite polling như SW protocol thật sẽ làm. |
-| Không test backpressure | `set_axis_slave_ready()` dùng `XIL_AXI4STREAM_READY_GEN_NO_BACKPRESSURE` — slave luôn ready. Logic `axis_out_stall` trong RTL **chưa được TB exercise**. |
-| Không test N_PE < D_HEAD (tiling) | TB luôn set N_PE = D_HEAD. Đường tiling (`i_col_base`, `o_result_col_base`) tồn tại trong RTL nhưng chưa có test case. |
+| Không test backpressure | `set_axis_slave_ready()` dùng `XIL_AXI4STREAM_READY_GEN_NO_BACKPRESSURE` — slave luôn ready. Logic `axis_out_stall` trong RTL, kể cả trong lúc tile loop, **chưa được TB exercise**. |
+| Chưa test config D_MODEL sát biên D_HEAD | Chưa có case `D_MODEL == D_HEAD` (chạm đúng assertion `D_MODEL >= D_HEAD`) để verify margin an toàn ping-pong ở biên. |
 
 ---
 
